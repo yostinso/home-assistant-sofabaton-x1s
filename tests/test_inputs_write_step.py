@@ -182,3 +182,46 @@ def test_failures_stop_the_sync(monkeypatch):
     proxy.cached.pop("raw_body")
     _install(monkeypatch, proxy)
     assert proxy._sync_step_inputs_write(added) is False
+
+
+def test_an_editor_unaware_of_the_hubs_inputs_appends_and_remaps(monkeypatch):
+    """The editor's bundle had no inputs page, so its pick became ordinal 1.
+
+    The hub's own entries must stay put (other activities address them by
+    position), the pick is appended, and the power-on write that follows
+    points at the hub's position for it, not the editor's 1.
+    """
+
+    live = _record([_entry(3, 1, "Phono"), _entry(4, 2, "Tape")])
+    proxy = InputsProxy(hub_version="X1S", input_mode=1, live=live)
+    _install(monkeypatch, proxy)
+
+    ok = proxy._sync_step_inputs_write({"device_id": DEVICE_ID, "entries": [_entry(9, 1, "Inputcd")]})
+
+    assert ok is True
+    page = parse_inputs_burst([proxy.written[0].payload], hub_version="X1S")
+    assert [(e.key_id, e.ordinal, e.label) for e in page.entries] == [(3, 1, "Phono"), (4, 2, "Tape"), (9, 3, "Inputcd")]
+    assert proxy._activity_sync_input_ordinal_remap[DEVICE_ID] == {1: 3}
+    assert [row["command_id"] for row in proxy.state.device_input_records[DEVICE_ID]["entries"]] == [3, 4, 9]
+
+    steps = [
+        {"device_id": DEVICE_ID, "command_id": 0xC6, "duration": 1, "delay": 255},
+        {"device_id": DEVICE_ID, "command_id": 0xC5, "duration": 1, "delay": 255},
+        {"device_id": 8, "command_id": 0xC5, "duration": 1, "delay": 255},
+    ]
+    remapped = proxy._activity_sync_remap_input_steps(steps)
+    assert [step["duration"] for step in remapped] == [1, 3, 1]   # only this device's input ref moves
+
+
+def test_a_pick_the_hub_already_lists_is_not_written_but_remapped(monkeypatch):
+    live = _record([_entry(3, 1, "Phono"), _entry(4, 2, "CD player")])
+    proxy = InputsProxy(hub_version="X1S", input_mode=1, live=live)
+    _install(monkeypatch, proxy)
+
+    ok = proxy._sync_step_inputs_write({"device_id": DEVICE_ID, "entries": [_entry(4, 1, "Inputcd")]})
+
+    assert ok is True
+    assert proxy.written == []
+    assert proxy._activity_sync_input_ordinal_remap[DEVICE_ID] == {1: 2}
+    # The hub's page (with its user-given names) is cached for the next bundle.
+    assert [row["name"] for row in proxy.state.device_input_records[DEVICE_ID]["entries"]] == ["Phono", "CD player"]

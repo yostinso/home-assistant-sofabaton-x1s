@@ -361,6 +361,7 @@ def build_activity_sync_plan(
     _plan_device_side(baseline, edited, activity_id, prereq, idle)
     _plan_membership(base_activity, edit_activity, _devices_by_id(edited), members)
     _plan_macros(base_activity, edit_activity, activity_id, macros, macro_pairing=pairing)
+    _plan_power_on_for_input_writes(edit_activity, activity_id, prereq, macros)
     _plan_bindings(base_activity, edit_activity, activity_id, bindings, macro_pairing=pairing)
     _plan_favorites(base_activity, edit_activity, activity_id, favorites, macro_pairing=pairing)
     _plan_rename(base_activity, edit_activity, activity_id, rename, hub_version=hub_version)
@@ -998,6 +999,45 @@ def _macro_write_step(
     if new:
         payload["new"] = True
     return SyncStep(kind="macro_write", label=_macro_label(button_id), payload=payload)
+
+
+def _plan_power_on_for_input_writes(
+    edit_activity: Mapping[str, Any],
+    activity_id: int,
+    prereq: list[SyncStep],
+    macros: list[SyncStep],
+) -> None:
+    """Rewrite the power-on macro whenever an input it selects is written.
+
+    The ``0xC5`` step selects an input by its position in the device's
+    inputs page, and ``inputs_write`` may land the editor's pick at a
+    different position than the editor assumed (its copy of the page can
+    be missing or stale). The executor translates the ordinal on the
+    power-on write, so that write must happen even when the editor's
+    ordinal byte happens to equal the baseline's.
+    """
+
+    input_devices = {
+        step.target_device_id for step in prereq
+        if step.kind == "inputs_write" and step.target_device_id is not None
+    }
+    if not input_devices:
+        return
+    if any(
+        step.kind == "macro_write" and _int(step.payload.get("button_id")) == POWER_ON_MACRO_BUTTON_ID
+        for step in macros
+    ):
+        return
+    power_on = _rows_by_button(edit_activity.get("macros")).get(POWER_ON_MACRO_BUTTON_ID)
+    if power_on is None:
+        return
+    if any(
+        _int(step.get("device_id")) in input_devices
+        and _int(step.get("command_id")) == DEVICE_INPUT_REF_COMMAND
+        and _int(step.get("duration")) > 0
+        for step in power_on.get("steps") or []
+    ):
+        macros.insert(0, _macro_write_step(activity_id, POWER_ON_MACRO_BUTTON_ID, power_on))
 
 
 def _macro_rows_differ(base_macro: Mapping[str, Any], edit_macro: Mapping[str, Any]) -> bool:

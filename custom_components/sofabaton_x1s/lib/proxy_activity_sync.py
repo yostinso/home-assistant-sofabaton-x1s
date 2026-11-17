@@ -24,7 +24,14 @@ from dataclasses import replace
 from typing import Any, Callable, Mapping, TYPE_CHECKING
 
 from .ack import AckOutcome
-from .activity_sync import ACTIVITY_ID_BASE, SyncStep, build_activity_sync_plan, build_device_sync_plan
+from .activity_sync import (
+    ACTIVITY_ID_BASE,
+    DEVICE_INPUT_REF_COMMAND,
+    POWER_ON_MACRO_BUTTON_ID,
+    SyncStep,
+    build_activity_sync_plan,
+    build_device_sync_plan,
+)
 from .device_create import (
     ACK_OPCODE_STATUS,
     ACK_STATUS_BYTE_OK,
@@ -388,6 +395,58 @@ class ActivitySyncMixin(_ProxyHost if TYPE_CHECKING else object):
         self._activity_sync_macro_id_remap: dict[int, int] = {}
         self._activity_sync_session_key_ids: set[int] = set()
         self._activity_sync_live_fav_cache: dict[int, dict[tuple[int, int], int]] = {}
+        self._activity_sync_input_ordinal_remap: dict[int, dict[int, int]] = {}
+
+    def _activity_sync_record_input_ordinals(
+        self,
+        device_id: int,
+        desired: list[dict[str, Any]],
+        hub_entries: list[dict[str, Any]],
+    ) -> None:
+        """Remember editor input ordinal -> hub input ordinal for ``device_id``.
+
+        An activity's power-on ``0xC5`` step selects an input by its 1-based
+        position in the device's inputs page. The editor numbered its picks
+        against its own copy of that page; ``inputs_write`` lands them where
+        the hub's page has (or now gets) the same command, so the power-on
+        macro write must point at those positions instead.
+        """
+
+        hub_ordinal = {
+            int(row.get("command_id") or 0) & 0xFF: int(row.get("input_index", 0) or 0)
+            for row in hub_entries
+        }
+        remap: dict[int, int] = {}
+        for row in desired:
+            editor_ordinal = int(row.get("input_index", row.get("ordinal", 0)) or 0)
+            target = hub_ordinal.get(int(row.get("command_id") or 0) & 0xFF)
+            if editor_ordinal > 0 and target:
+                remap[editor_ordinal] = target
+        remaps = getattr(self, "_activity_sync_input_ordinal_remap", None)
+        if remaps is None:
+            remaps = self._activity_sync_input_ordinal_remap = {}
+        remaps[device_id & 0xFF] = remap
+
+    def _activity_sync_remap_input_steps(self, steps: Any) -> list[Any]:
+        """``steps`` with each ``0xC5`` input ref re-pointed at the hub's ordinal."""
+
+        remaps = getattr(self, "_activity_sync_input_ordinal_remap", None) or {}
+        out: list[Any] = []
+        for step in steps or []:
+            if (
+                isinstance(step, Mapping)
+                and (int(step.get("command_id") or 0) & 0xFF) == DEVICE_INPUT_REF_COMMAND
+            ):
+                remap = remaps.get(int(step.get("device_id") or 0) & 0xFF)
+                ordinal = int(step.get("duration") or 0) & 0xFF
+                if remap and ordinal in remap and remap[ordinal] != ordinal:
+                    self._log.info(
+                        "[ACTIVITY_SYNC] power-on input dev=0x%02X: editor ordinal %d is hub ordinal %d",
+                        int(step.get("device_id") or 0) & 0xFF, ordinal, remap[ordinal],
+                    )
+                    step = {**step, "duration": remap[ordinal]}
+            out.append(step)
+        return out
 
     def _activity_sync_live_favorite_fav_ids(self, activity_id: int) -> dict[tuple[int, int], int]:
         """Per-run cached live favorite map (content → hub fav_id).
@@ -1099,7 +1158,10 @@ class ActivitySyncMixin(_ProxyHost if TYPE_CHECKING else object):
             if session_ids is None:
                 session_ids = self._activity_sync_session_key_ids = set()
             session_ids.add(button_id & 0xFF)
-        key_sequence = self._macro_key_sequence_from_steps(payload.get("steps") or [])
+        steps = payload.get("steps") or []
+        if (button_id & 0xFF) == POWER_ON_MACRO_BUTTON_ID:
+            steps = self._activity_sync_remap_input_steps(steps)
+        key_sequence = self._macro_key_sequence_from_steps(steps)
         label_slot = self._activity_sync_macro_label_slot(entity_id, button_id)
         label = _power_macro_label(button_id) or str(payload.get("name") or "")
         wire = build_macro_save_payload(
@@ -1235,15 +1297,35 @@ class ActivitySyncMixin(_ProxyHost if TYPE_CHECKING else object):
         live_entries = [dict(row) for row in (live or {}).get("entries") or [] if isinstance(row, Mapping)]
         live_ids = [int(row.get("command_id") or 0) & 0xFF for row in live_entries]
 
+        # The hub's entries always stay where they are (other activities
+        # address them by position); the edit's commands the hub does not
+        # list yet are appended. The editor's copy can disagree with the
+        # hub's list -- e.g. a bundle captured without the device's inputs
+        # page numbers its first pick 1 -- so the editor's ordinals are
+        # translated to the hub's for the power-on macro write that follows.
+        added: list[dict[str, Any]] = []
+        for row, command_id in zip(desired, desired_ids):
+            if command_id and command_id not in live_ids and all(
+                (int(r.get("command_id") or 0) & 0xFF) != command_id for r in added
+            ):
+                added.append(row)
         if desired_ids[: len(live_ids)] != live_ids:
             self._log.info(
-                "[ACTIVITY_SYNC] inputs_write dev=0x%02X: not an append (hub %s, edit %s); "
-                "leaving the hub's inputs page as it is",
-                dev_lo, live_ids, desired_ids,
+                "[ACTIVITY_SYNC] inputs_write dev=0x%02X: the edit's list (%s) is not an append to the "
+                "hub's (%s); keeping the hub's entries and appending %d new one(s)",
+                dev_lo, desired_ids, live_ids, len(added),
             )
-            return True
-        added = desired[len(live_ids):]
+
+        record = dict(live or {})
+        next_ordinal = max((int(row.get("input_index", 0) or 0) for row in live_entries), default=0)
+        entries = list(live_entries)
+        for row in added:
+            next_ordinal += 1
+            entries.append({**row, "input_index": next_ordinal})
+        self._activity_sync_record_input_ordinals(dev_lo, desired, entries)
         if not added:
+            if live is not None:
+                self.state.device_input_records[dev_lo] = dict(live)
             return True
 
         if not config.is_input_configured:
@@ -1269,12 +1351,6 @@ class ActivitySyncMixin(_ProxyHost if TYPE_CHECKING else object):
                 device["input_mode"] = 1
                 device["inputs_configured"] = True
 
-        record = dict(live or {})
-        next_ordinal = max((int(row.get("input_index", 0) or 0) for row in live_entries), default=0)
-        entries = list(live_entries)
-        for row in added:
-            next_ordinal += 1
-            entries.append({**row, "input_index": next_ordinal})
         record["entries"] = entries
         page, count = self._restore_input_payload(
             device_id=dev_lo,

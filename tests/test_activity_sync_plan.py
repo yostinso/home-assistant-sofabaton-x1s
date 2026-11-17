@@ -602,6 +602,27 @@ def test_existing_member_input_change_rides_macro_write() -> None:
     assert steps[-1]["duration"] == 2
 
 
+def test_input_write_forces_the_power_on_rewrite() -> None:
+    """The editor's bundle had no inputs page for device 1, so "Set input"
+    appended its pick as ordinal 1 -- the ordinal the 0xC5 step already
+    held. The power-on macro is unchanged byte-for-byte, but the hub may
+    file the pick at another position, so the plan must still rewrite it
+    (after the inputs page) for the executor to re-point the step."""
+    base = base_bundle()
+    _activity(base)["macros"][0]["steps"].append(
+        {"device_id": 1, "command_id": 0xC5, "button_code": 0, "duration": 1, "delay": 255}
+    )
+    edited = copy.deepcopy(base)
+    _device(edited, 1)["input_record"] = {
+        "entries": [{"command_id": 9, "input_index": 1, "name": "Inputcd"}]
+    }
+    plan = build_activity_sync_plan(base, edited, ACTIVITY_ID)
+    kinds = _kinds(plan)
+    assert kinds.index("inputs_write") < kinds.index("macro_write")
+    write = next(s for s in plan if s.kind == "macro_write")
+    assert write.payload["button_id"] == 198
+
+
 def test_power_macro_absent_from_baseline_is_not_flagged_new() -> None:
     """BUG #8 repro tail: a fresh activity's baseline has no 198/199 rows,
     but power macros live at fixed wire ids outside the fav-id namespace —

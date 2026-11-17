@@ -84,6 +84,7 @@ import {
   buttonName,
   clearActivityDeviceInput,
   deviceCommandItems,
+  deviceInputCommandItems,
   removeActivityMacroStep,
   renameBundleActivity,
   bundleEntityAppearance,
@@ -711,6 +712,12 @@ export class SbPanelActivityEditor extends SbPanelEntityEditor {
   private _commandOptions(deviceId: number | null): Array<{ value: number; label: string }> {
     if (deviceId == null || !this._working) return [];
     return deviceCommandItems(this._working, deviceId).map((command) => ({ value: command.commandId, label: command.label }));
+  }
+
+  /** The "Set input" choices: configured inputs first, under their hub (user-renamed) names. */
+  private _inputOptions(deviceId: number | null): Array<{ value: number; label: string }> {
+    if (deviceId == null || !this._working) return [];
+    return deviceInputCommandItems(this._working, deviceId).map((command) => ({ value: command.commandId, label: command.label }));
   }
 
   private _openAddBinding = (): void => {
@@ -1693,7 +1700,7 @@ export class SbPanelActivityEditor extends SbPanelEntityEditor {
     const isEdit = dialog.editIndex !== null;
     const isInput = dialog.kind === "input";
     const isWifiEvent = dialog.kind === "wifi_event";
-    const commands = this._commandOptions(dialog.deviceId);
+    const commands = isInput ? this._inputOptions(dialog.deviceId) : this._commandOptions(dialog.deviceId);
     const canSave = isInput || (isWifiEvent ? dialog.slot != null : dialog.commandId != null && dialog.deviceId != null);
     const title = isInput ? B.inputStepTitle : isEdit ? B.stepDialogEditTitle : B.stepDialogAddTitle;
     const body = isInput
