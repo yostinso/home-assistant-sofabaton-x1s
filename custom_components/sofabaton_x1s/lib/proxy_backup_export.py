@@ -305,6 +305,13 @@ class BackupExportMixin(_ProxyHost if TYPE_CHECKING else object):
             blob_source = None
 
         if skip_inputs:
+            # Otherwise silent: a device missing its inputs list in the
+            # editor is indistinguishable from a failed read without this.
+            self._log.info(
+                "[INPUT_QUERY] dev=0x%02X: device record has input_mode 0 (no inputs configured); "
+                "not reading its inputs page",
+                dev_lo,
+            )
             self.state.device_input_records.pop(dev_lo, None)
         else:
             input_record = self.fetch_device_input_record(dev_lo, timeout=wait_timeout)
