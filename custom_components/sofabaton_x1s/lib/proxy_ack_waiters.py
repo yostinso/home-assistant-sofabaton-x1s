@@ -656,6 +656,15 @@ class AckWaitersMixin(_ProxyHost if TYPE_CHECKING else object):
             return None
 
         record = parse_inputs_burst(list(burst.payloads), hub_version=self.hub_version)
+        self._log.debug(
+            "[INPUT_QUERY] inputs page dev=0x%02X: %d page(s), source_id_byte=%d, %d entr%s %s",
+            device_id & 0xFF,
+            len(burst.payloads),
+            record.source_id_byte & 0xFF,
+            len(record.entries),
+            "y" if len(record.entries) == 1 else "ies",
+            [(entry.key_id & 0xFF, entry.ordinal, entry.label) for entry in record.entries],
+        )
         return {
             "device_id": record.device_id & 0xFF,
             "source_id_byte": record.source_id_byte & 0xFF,
