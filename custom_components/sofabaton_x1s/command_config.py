@@ -1061,6 +1061,77 @@ class CommandConfigStore:
         await self._save()
         return True
 
+    def export_hub_section(self, entry_id: str) -> dict[str, Any]:
+        """A normalized copy of everything stored for one hub (the backup's
+        ``ha_config.wifi_commands`` source; see wifi_config_backup)."""
+
+        hub = self._hub_record(entry_id)
+        section: dict[str, Any] = {
+            "devices": deepcopy(self._hub_device_records(entry_id)),
+            "event_actions": self.get_hub_event_actions(entry_id),
+            "activity_event_actions": self.get_activity_event_actions(entry_id),
+            "matter_event_actions": self.get_matter_event_actions(entry_id),
+        }
+        matter_device_id = hub.get("matter_device_id")
+        if isinstance(matter_device_id, str) and matter_device_id:
+            section["matter_device_id"] = matter_device_id
+        return section
+
+    async def async_apply_restore_plan(self, entry_id: str, plan: dict[str, Any]) -> int:
+        """Write a :func:`wifi_config_backup.plan_wifi_commands_restore`
+        result into the store. Returns how many device records it wrote."""
+
+        hub = self._hub_record(entry_id)
+        devices = self._hub_device_records(entry_id)
+        restored = [
+            _normalize_device_payload(record, fallback_key=f"device{idx + 1}")
+            for idx, record in enumerate(plan.get("devices") or [])
+        ]
+        if plan.get("replace_devices"):
+            merged = restored
+        else:
+            restored_keys = {record["device_key"] for record in restored}
+            restored_ids = {
+                record["deployed_device_id"]
+                for record in restored
+                if isinstance(record.get("deployed_device_id"), int)
+            }
+            # A kept record that claimed a restored device id lost it: that
+            # device is now the restored record's.
+            merged = []
+            for device in devices:
+                if device["device_key"] in restored_keys:
+                    continue
+                if device.get("deployed_device_id") in restored_ids:
+                    device["deployed_device_id"] = None
+                    device["deployed_commands_hash"] = ""
+                    device["deployed_commands"] = []
+                merged.append(device)
+            merged.extend(restored)
+        hub["devices"] = merged
+        # Re-run the normalizer so the user-device cap and key dedupe apply.
+        self._hub_device_records(entry_id)
+
+        activity_actions = plan.get("activity_event_actions") or {}
+        hub_actions = plan.get("hub_actions")
+        if hub_actions is not None:
+            hub["event_actions"] = normalize_hub_event_actions(hub_actions.get("event_actions"))
+            hub["matter_event_actions"] = normalize_matter_event_actions(
+                hub_actions.get("matter_event_actions")
+            )
+            matter_device_id = hub_actions.get("matter_device_id")
+            if isinstance(matter_device_id, str) and matter_device_id:
+                hub["matter_device_id"] = matter_device_id
+            else:
+                hub.pop("matter_device_id", None)
+            hub["activity_event_actions"] = normalize_activity_event_actions(activity_actions)
+        elif activity_actions:
+            current = normalize_activity_event_actions(hub.get("activity_event_actions"))
+            current.update(normalize_activity_event_actions(activity_actions))
+            hub["activity_event_actions"] = current
+        await self._save()
+        return len(restored)
+
     async def async_reconcile_deployed_wifi_devices(
         self,
         entry_id: str,

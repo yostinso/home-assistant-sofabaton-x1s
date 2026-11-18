@@ -674,6 +674,10 @@ export interface BackupBundlePayload {
   } | null;
   devices: BackupBundleDevicePayload[];
   activities: BackupBundleActivityPayload[];
+  /** Home Assistant-side configuration (the Wifi Commands store section).
+   * Opaque to the card: carried through edit and restore unchanged and
+   * applied by the backend after the hub restore. Absent on older files. */
+  ha_config?: Record<string, unknown> | null;
 }
 
 export const BACKUP_BUNDLE_SCHEMA_VERSION = 5;

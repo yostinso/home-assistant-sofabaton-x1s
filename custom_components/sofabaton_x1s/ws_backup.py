@@ -6,6 +6,7 @@ operation runners and request validation.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Mapping
 
@@ -20,6 +21,68 @@ from .const import (
 from .hub import SofabatonHub
 from . import operations
 from . import runtime
+from .const import signal_command_sync
+from .wifi_config_backup import (
+    HA_CONFIG_KEY,
+    WIFI_COMMANDS_KEY,
+    build_wifi_commands_section,
+    plan_wifi_commands_restore,
+    restore_id_maps,
+    wifi_commands_section,
+)
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def _async_attach_wifi_commands(
+    hass: HomeAssistant,
+    hub: SofabatonHub,
+    bundle: dict[str, Any],
+    device_ids: list[int] | None,
+) -> None:
+    """Add the hub's Wifi Commands store section to an exported bundle."""
+
+    store = await runtime._async_get_command_config_store(hass)
+    section = build_wifi_commands_section(
+        store.export_hub_section(hub.entry_id),
+        device_ids=device_ids,
+    )
+    ha_config = bundle.setdefault(HA_CONFIG_KEY, {})
+    if isinstance(ha_config, dict):
+        ha_config[WIFI_COMMANDS_KEY] = section
+
+
+async def _async_restore_wifi_commands(
+    hass: HomeAssistant,
+    hub: SofabatonHub,
+    bundle: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    replace_mode: bool,
+) -> int | None:
+    """Write a restored bundle's Wifi Commands section back to the store.
+
+    Returns the number of device records written, or None when the bundle
+    carries no section (a backup made before this existed)."""
+
+    section = wifi_commands_section(bundle)
+    if section is None:
+        return None
+    device_map, activity_map = restore_id_maps(result)
+    bundle_hub = bundle.get("hub") if isinstance(bundle.get("hub"), Mapping) else {}
+    same_hub = str(bundle_hub.get("entry_id") or "") == hub.entry_id
+    plan = plan_wifi_commands_restore(
+        section,
+        device_id_map=device_map,
+        activity_id_map=activity_map,
+        replace_mode=replace_mode,
+        same_hub=same_hub,
+    )
+    store = await runtime._async_get_command_config_store(hass)
+    written = await store.async_apply_restore_plan(hub.entry_id, plan)
+    async_dispatcher_send(hass, signal_command_sync(hub.entry_id))
+    return written
 
 
 def _validate_backup_device_ids(raw_device_ids: Any) -> list[int] | None:
@@ -135,6 +198,7 @@ async def _run_backup_export_operation(
             device_ids=device_ids,
             progress_callback=_progress,
         )
+        await _async_attach_wifi_commands(hass, hub, result, device_ids)
         registry.update(
             operation_id,
             status="success",
@@ -204,10 +268,27 @@ async def _run_backup_restore_operation(
                 result=result,
             )
             return
+        message = "Restore completed."
+        if isinstance(result, dict):
+            try:
+                written = await _async_restore_wifi_commands(
+                    hass, hub, payload, result, replace_mode=(mode == "replace")
+                )
+            except Exception:  # noqa: BLE001 - the hub restore already landed
+                _LOGGER.warning(
+                    "[%s] restore finished, but restoring the Wifi Commands configuration failed",
+                    hub.entry_id,
+                    exc_info=True,
+                )
+                message = "Restore completed, but the Wifi Commands configuration could not be restored."
+                written = None
+            if written is not None:
+                result = dict(result)
+                result["wifi_commands_restored"] = written
         success_payload: dict[str, Any] = {
             "status": "success",
             "phase": "completed",
-            "message": "Restore completed.",
+            "message": message,
             "result": result or {"status": "success"},
         }
         if isinstance(result, dict):
